@@ -205,73 +205,124 @@ nodes:
   - id: eng-review
     loop:
       prompt: |
-        # Engineering Review Gate (GATE A) — pc-director
+        # Engineering Review Gate (GATE A) — /plan-eng-review
 
-        You are a senior architect reviewing this work item before implementation begins.
+        **Work item**: $fetch-item.output
+        **Classification**: $classify.output
+        **Complexity**: $complexity-gate.output
+        **Previous user input**: $LOOP_USER_INPUT
 
-        ## Context available
+        ---
 
-        **Work item classification**: $classify.output
-        **Complexity assessment**: $complexity-gate.output
-
-        ## Step 1: Load investigation/plan findings
+        ## Every iteration — check approval first
         ```bash
-        cat "$ARTIFACTS_DIR/investigation.md" 2>/dev/null || cat "$ARTIFACTS_DIR/plan.md" 2>/dev/null || echo "(no artifact found)"
-        cat CLAUDE.md 2>/dev/null | head -100 || echo "(no CLAUDE.md)"
-        git log --oneline -10
+        echo "$LOOP_USER_INPUT" | grep -qi "approved" && echo "USER_APPROVED" || true
+        ```
+        If USER_APPROVED:
+        - Say: "Engineering review approved. Proceeding to implementation."
+        - Signal: <promise>ENG_REVIEW_APPROVED</promise>
+        - Stop. Do not re-run the review.
+
+        ---
+
+        ## First iteration (when $LOOP_USER_INPUT is empty)
+
+        ### 1. Run gstack preamble
+        ```bash
+        _UPD=$(~/.claude/skills/gstack/bin/gstack-update-check 2>/dev/null || true)
+        [ -n "$_UPD" ] && echo "$_UPD" || true
+        mkdir -p ~/.gstack/sessions && touch ~/.gstack/sessions/"$PPID"
+        eval "$(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)" 2>/dev/null || true
+        _BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
+        echo "BRANCH: $_BRANCH"
+        _LEARN_FILE="${GSTACK_HOME:-$HOME/.gstack}/projects/${SLUG:-unknown}/learnings.jsonl"
+        [ -f "$_LEARN_FILE" ] && echo "LEARNINGS: $(wc -l < "$_LEARN_FILE" | tr -d ' ')" || echo "LEARNINGS: 0"
+        [ -f "$_LEARN_FILE" ] && [ "$(wc -l < "$_LEARN_FILE" | tr -d ' ')" -gt 5 ] 2>/dev/null && \
+          ~/.claude/skills/gstack/bin/gstack-learnings-search --limit 3 2>/dev/null || true
+        _REPO_TOP=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+        [ -f "$HOME/.gbrain/config.json" ] && command -v gbrain >/dev/null 2>&1 && \
+          [ -n "$_REPO_TOP" ] && [ -f "$_REPO_TOP/.gbrain-source" ] && \
+          echo "GBrain: configured — prefer gbrain search/query over Grep" || true
+        ~/.claude/skills/gstack/bin/gstack-timeline-log \
+          '{"skill":"plan-eng-review","event":"archon-gate-a","branch":"'"$_BRANCH"'"}' 2>/dev/null || true
         ```
 
-        ## Step 2: Load code graph context (if available)
-        Use code-review-graph MCP semantic_search or get_architecture_overview if connected.
-        Otherwise use git log and the investigation artifact above.
+        ### 2. Load /plan-eng-review skill
+        ```bash
+        cat "${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}/plan-eng-review/SKILL.md"
+        ```
+        Read it in full. You will follow its interactive review flow now.
 
-        ## Step 3: Identify top 3 implementation risks
-        Based on the work item, investigation findings, and codebase context:
-        - Risk 1: [what could go wrong, what files/components are affected]
-        - Risk 2: [dependency or integration risk]
-        - Risk 3: [test coverage or regression risk]
+        ### 3. Load investigation and codebase context
+        ```bash
+        cat "$ARTIFACTS_DIR/investigation.md" 2>/dev/null || cat "$ARTIFACTS_DIR/plan.md" 2>/dev/null || echo "(no artifact)"
+        cat CLAUDE.md 2>/dev/null | head -120 || echo "(no CLAUDE.md)"
+        ```
 
-        ## Step 4: Present to user and request confirmation
+        ### 4. Announce and run the review
+        Tell the user:
+        > "Starting Engineering Review (GATE A).
+        >  Invoking /plan-eng-review with the ADO work item context pre-loaded."
 
-        Write your findings to $ARTIFACTS_DIR/eng-review.md:
+        Follow plan-eng-review's instructions exactly with this ADO context pre-loaded:
+        - Work item title, description, AC from $fetch-item.output
+        - Issue type, classification from $classify.output
+        - Complexity verdict, quality_gates, ac_count from $complexity-gate.output
+        - Investigation/plan artifact loaded above
+
+        Complete all four review sections (Architecture, Code Quality, Tests, Performance).
+        Since this is an Archon interactive gate, present all findings as one comprehensive
+        document rather than per-section AskUserQuestion stops.
+
+        ### 5. Write eng-review.md and present
         ```bash
         cat > "$ARTIFACTS_DIR/eng-review.md" << 'ENGEOF'
         # Engineering Review — [work item title]
 
         ## Architecture Impact
-        [which layers/services are affected]
+        [which layers/services/components are affected]
 
         ## Affected Components
-        [file names, function names — stop before tracing implementation]
+        [specific files and functions from investigation + code graph]
 
         ## Data Flow Changes
-        [summary of affected data path]
+        [summary of the affected data path]
 
         ## Top 3 Risks
         1. [risk + mitigation]
         2. [risk + mitigation]
         3. [risk + mitigation]
 
+        ## Code Quality Findings
+        [DRY violations, error handling gaps, tech debt hotspots]
+
+        ## Test Coverage Gaps
+        [missing tests for new code paths; regressions to guard]
+
+        ## Performance Considerations
+        [N+1 risks, caching opportunities, memory concerns]
+
         ## Technical Approach
-        [recommended implementation approach from investigation]
+        [recommended implementation strategy from investigation + review]
 
         ## Quality Gates
-        [quality_gates from complexity-gate output]
+        [quality_gates value from $complexity-gate.output]
         ENGEOF
         ```
 
-        Present your analysis clearly and ask:
-        > "Engineering review complete. Risks identified above.
-        > Respond 'approved' to proceed with implementation, or provide adjustments."
+        Present the review and ask:
+        > "Engineering review complete. See findings above.
+        > Type **'approved'** to proceed, or provide feedback to refine any section."
 
-        ## Step 5: On user approval
-        Signal: <promise>ENG_REVIEW_APPROVED</promise>
+        ---
 
-        **Previous user input**: $LOOP_USER_INPUT
+        ## Feedback iteration (when $LOOP_USER_INPUT has feedback)
+        Read $ARTIFACTS_DIR/eng-review.md, incorporate feedback, rewrite the file, re-present.
+        If feedback says "approved", signal: <promise>ENG_REVIEW_APPROVED</promise>
       until: ENG_REVIEW_APPROVED
       max_iterations: 5
       interactive: true
-      gate_message: "Review the engineering analysis. Say 'approved' or provide feedback to refine."
+      gate_message: "Engineering review ready. Type 'approved' to proceed, or provide feedback on any section."
     depends_on: [bridge-artifacts, complexity-gate]
     when: "$complexity-gate.output.complexity == 'complex'"
     context: fresh
