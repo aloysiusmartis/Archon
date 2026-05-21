@@ -5,20 +5,25 @@ description: |
             "fix work item #123", "resolve AB#123".
   NOT for: Comprehensive multi-agent reviews, questions about items, CI failures, PR reviews.
 
-  Mirrors archon-fix-github-issue but uses Azure DevOps CLI (az) instead of gh:
+  Mirrors archon-fix-github-issue but uses Azure DevOps CLI (az) instead of gh.
+  Incorporates pc-director's engineering review gate for complex tasks:
   1. Fetches the work item (az boards work-item show)
-  2. Classifies type (bug/feature/enhancement/etc)
+  2. Classifies type (bug/feature/enhancement/etc) + complexity (simple/complex)
   3. Researches context (web + codebase)
   4. Routes to investigate (bugs) or plan (features)
-  5. Implements the fix/feature with validation
-  6. Creates a draft PR (az repos pr create --draft)
-  7. Runs smart review (code review + conditional agents)
-  8. Aggressively self-fixes all findings
-  9. Simplifies changed code
-  10. Posts completion report as discussion comment on the work item
+  5. [Complex tasks only] Engineering review gate — interactive Gate A, user confirms risks
+  6. [Complex tasks only] Enriches ADO ticket with HTML eng-review comment + technical AC
+  7. Configures quality gates (lint/build/tests/new-tests/conflict-check per task type)
+  8. Implements the fix/feature with validation
+  9. Creates a draft PR (az repos pr create --draft)
+  10. Runs smart review (code review + conditional agents)
+  11. Aggressively self-fixes all findings
+  12. Simplifies changed code
+  13. Posts completion report as discussion comment on the work item
 
 provider: claude
 model: sonnet
+interactive: true
 
 nodes:
   # ═══════════════════════════════════════════════════════════════
@@ -98,6 +103,59 @@ nodes:
           type: string
       required: [issue_type, title, reasoning]
 
+  # Classify task complexity (runs in parallel with web-research)
+  - id: complexity-gate
+    prompt: |
+      Classify this Azure DevOps work item as simple or complex.
+
+      ## Work Item
+      $fetch-item.output
+
+      ## Classification (from earlier step)
+      $classify.output
+
+      ## Simple task — ALL of these must hold:
+      - Acceptance criteria has ≤ 2 items (count `<li>` tags or bullet lines in the AC HTML)
+      - Title + description contain NONE of: refactor, architect, migrat, schema, database,
+        extract, consolidat, modulariz, split, seam, redesign, restructure, new endpoint,
+        new service, new component
+      - Change is clearly a UI/asset swap, text update, config change, or small isolated bug fix
+
+      ## Complex task — ANY one of these applies:
+      - AcceptanceCriteria has 3+ items
+      - Complexity keywords present in title or description (see above)
+      - Structural code changes (new files, new services, schema changes, new components)
+
+      ## Quality gates by issue_type:
+      | issue_type | quality_gates |
+      |---|---|
+      | bug | lint,build,tests,conflict-check |
+      | feature | lint,build,tests,new-tests,conflict-check |
+      | enhancement | lint,build,tests,new-tests,conflict-check |
+      | refactor | lint,build,tests,conflict-check |
+      | chore | lint,build,conflict-check |
+      | documentation | conflict-check |
+
+      Return the classification with the quality_gates appropriate for this issue_type.
+    depends_on: [fetch-item, classify]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        complexity:
+          type: string
+          enum: ["simple", "complex"]
+        reason:
+          type: string
+        quality_gates:
+          type: string
+          description: "comma-separated quality gates appropriate for this issue_type"
+        ac_count:
+          type: integer
+          description: "number of acceptance criteria items found"
+      required: [complexity, reason, quality_gates, ac_count]
+
   # ═══════════════════════════════════════════════════════════════
   # PHASE 2: RESEARCH
   # ═══════════════════════════════════════════════════════════════
@@ -113,13 +171,13 @@ nodes:
 
   - id: investigate
     command: archon-investigate-issue
-    depends_on: [classify, web-research]
+    depends_on: [classify, web-research, complexity-gate]
     when: "$classify.output.issue_type == 'bug'"
     context: fresh
 
   - id: plan
     command: archon-create-plan
-    depends_on: [classify, web-research]
+    depends_on: [classify, web-research, complexity-gate]
     when: "$classify.output.issue_type != 'bug'"
     context: fresh
 
@@ -138,12 +196,190 @@ nodes:
     trigger_rule: one_success
 
   # ═══════════════════════════════════════════════════════════════
+  # PHASE 3.5: ENGINEERING REVIEW GATE (from pc-director)
+  # Complex tasks only — user confirms architecture risks before implementation.
+  # Simple tasks bypass via simple-path-bridge.
+  # Both paths converge at quality-gate-config.
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: eng-review
+    loop:
+      prompt: |
+        # Engineering Review Gate (GATE A) — pc-director
+
+        You are a senior architect reviewing this work item before implementation begins.
+
+        ## Context available
+
+        **Work item classification**: $classify.output
+        **Complexity assessment**: $complexity-gate.output
+
+        ## Step 1: Load investigation/plan findings
+        ```bash
+        cat "$ARTIFACTS_DIR/investigation.md" 2>/dev/null || cat "$ARTIFACTS_DIR/plan.md" 2>/dev/null || echo "(no artifact found)"
+        cat CLAUDE.md 2>/dev/null | head -100 || echo "(no CLAUDE.md)"
+        git log --oneline -10
+        ```
+
+        ## Step 2: Load code graph context (if available)
+        Use code-review-graph MCP semantic_search or get_architecture_overview if connected.
+        Otherwise use git log and the investigation artifact above.
+
+        ## Step 3: Identify top 3 implementation risks
+        Based on the work item, investigation findings, and codebase context:
+        - Risk 1: [what could go wrong, what files/components are affected]
+        - Risk 2: [dependency or integration risk]
+        - Risk 3: [test coverage or regression risk]
+
+        ## Step 4: Present to user and request confirmation
+
+        Write your findings to $ARTIFACTS_DIR/eng-review.md:
+        ```bash
+        cat > "$ARTIFACTS_DIR/eng-review.md" << 'ENGEOF'
+        # Engineering Review — [work item title]
+
+        ## Architecture Impact
+        [which layers/services are affected]
+
+        ## Affected Components
+        [file names, function names — stop before tracing implementation]
+
+        ## Data Flow Changes
+        [summary of affected data path]
+
+        ## Top 3 Risks
+        1. [risk + mitigation]
+        2. [risk + mitigation]
+        3. [risk + mitigation]
+
+        ## Technical Approach
+        [recommended implementation approach from investigation]
+
+        ## Quality Gates
+        [quality_gates from complexity-gate output]
+        ENGEOF
+        ```
+
+        Present your analysis clearly and ask:
+        > "Engineering review complete. Risks identified above.
+        > Respond 'approved' to proceed with implementation, or provide adjustments."
+
+        ## Step 5: On user approval
+        Signal: <promise>ENG_REVIEW_APPROVED</promise>
+
+        **Previous user input**: $LOOP_USER_INPUT
+      until: ENG_REVIEW_APPROVED
+      max_iterations: 5
+      interactive: true
+      gate_message: "Review the engineering analysis. Say 'approved' or provide feedback to refine."
+    depends_on: [bridge-artifacts, complexity-gate]
+    when: "$complexity-gate.output.complexity == 'complex'"
+    context: fresh
+    model: sonnet
+
+  - id: enrich-ado
+    prompt: |
+      Post the engineering review findings to the Azure DevOps work item as a discussion comment.
+      ADO renders HTML — use HTML tags, not markdown.
+
+      ## Step 1: Load artifacts
+      ```bash
+      ITEM_ID=$(cat "$ARTIFACTS_DIR/.work-item-id")
+      cat "$ARTIFACTS_DIR/eng-review.md"
+      ```
+
+      ## Step 2: Post HTML comment to ADO ticket
+      ```bash
+      az boards work-item update --id "$ITEM_ID" --discussion "<h2>Engineering Review (Archon)</h2><h3>Architecture Impact</h3><p>...</p><h3>Top Risks</h3><ul><li>...</li></ul><h3>Technical Approach</h3><p>...</p><h3>Quality Gates</h3><p>...</p>"
+      ```
+      Convert the eng-review.md content to HTML sections for the comment body.
+
+      ## Step 3: Append technical AC to the AcceptanceCriteria field
+      ```bash
+      EXISTING_AC=$(az boards work-item show --id "$ITEM_ID" \
+        --query "fields.\"Microsoft.VSTS.Common.AcceptanceCriteria\"" -o tsv 2>/dev/null || echo "")
+      TECHNICAL_AC="${EXISTING_AC}<h2>Technical Acceptance Criteria (Archon Engineering Review)</h2><ul><li>All quality gates pass: ...</li><li>No new test regressions</li><li>Implementation matches technical approach from engineering review</li></ul>"
+      az boards work-item update --id "$ITEM_ID" \
+        --fields "Microsoft.VSTS.Common.AcceptanceCriteria=$TECHNICAL_AC"
+      ```
+
+      ## Step 4: Write quality gates to artifact
+      ```bash
+      echo "$quality_gates_from_complexity_gate" > "$ARTIFACTS_DIR/.quality-gates"
+      cat "$ARTIFACTS_DIR/.quality-gates"
+      ```
+      (use the quality_gates value from $complexity-gate.output)
+
+      ## Step 5: Confirm
+      Print: "ADO work item $ITEM_ID enriched with engineering review comment and technical AC."
+    depends_on: [eng-review]
+    when: "$complexity-gate.output.complexity == 'complex'"
+    context: fresh
+
+  - id: simple-path-bridge
+    bash: |
+      echo "Simple task: bypassing engineering review gate"
+      # Write quality gates derived from complexity-gate classification
+      echo "lint,build,conflict-check" > "$ARTIFACTS_DIR/.quality-gates"
+      cat "$ARTIFACTS_DIR/.quality-gates"
+      echo "simple-path-bridge: done"
+    depends_on: [bridge-artifacts, complexity-gate]
+    when: "$complexity-gate.output.complexity == 'simple'"
+
+  - id: quality-gate-config
+    prompt: |
+      Configure quality gates for the implementation step.
+
+      ## Complexity assessment
+      $complexity-gate.output
+
+      ## Step 1: Read the quality gates from artifacts
+      ```bash
+      cat "$ARTIFACTS_DIR/.quality-gates" 2>/dev/null || echo "(not yet written)"
+      ```
+
+      ## Step 2: Write final quality gates
+      Use the `quality_gates` field from the complexity-gate output.
+      ```bash
+      echo "<quality_gates_value>" > "$ARTIFACTS_DIR/.quality-gates"
+      ```
+
+      ## Step 3: Append quality gates to investigation artifact
+      The implement step reads investigation.md — append the quality gates so the agent knows what to verify.
+      ```bash
+      GATES=$(cat "$ARTIFACTS_DIR/.quality-gates")
+      cat >> "$ARTIFACTS_DIR/investigation.md" << GATEEOF
+
+      ---
+      ## Quality Gates Required (from pc-director gate classification)
+
+      Run these before committing: \`$GATES\`
+
+      | Gate | Command |
+      |------|---------|
+      | lint | bun run lint (or project linter) |
+      | build | bun run build (or project build) |
+      | tests | bun test (baseline then current, no new failures) |
+      | new-tests | verify new test files exist for new behavior |
+      | conflict-check | git fetch origin; git merge-base --is-ancestor origin/<base> HEAD |
+
+      Do NOT mark done without passing all required gates.
+      GATEEOF
+      ```
+
+      ## Step 4: Confirm
+      Print: "Quality gates configured: <value>"
+    depends_on: [enrich-ado, simple-path-bridge]
+    trigger_rule: one_success
+    model: haiku
+
+  # ═══════════════════════════════════════════════════════════════
   # PHASE 4: IMPLEMENT
   # ═══════════════════════════════════════════════════════════════
 
   - id: implement
     command: archon-fix-issue
-    depends_on: [bridge-artifacts]
+    depends_on: [quality-gate-config]
     context: fresh
     model: opus[1m]
 
@@ -385,8 +621,10 @@ nodes:
       ITEM_ID=$(cat "$ARTIFACTS_DIR/.work-item-id" 2>/dev/null || echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
       PR_ID=$(cat "$ARTIFACTS_DIR/.pr-id" 2>/dev/null || echo "unknown")
       PR_URL=$(cat "$ARTIFACTS_DIR/.pr-url" 2>/dev/null || echo "unknown")
+      QUALITY_GATES=$(cat "$ARTIFACTS_DIR/.quality-gates" 2>/dev/null || echo "not configured")
       cat "$ARTIFACTS_DIR/investigation.md" 2>/dev/null
       cat "$ARTIFACTS_DIR/plan.md" 2>/dev/null
+      cat "$ARTIFACTS_DIR/eng-review.md" 2>/dev/null
       cat "$ARTIFACTS_DIR/implementation.md" 2>/dev/null
       cat "$ARTIFACTS_DIR/validation.md" 2>/dev/null
       cat "$ARTIFACTS_DIR/review/consolidated-review.md" 2>/dev/null
@@ -416,6 +654,10 @@ nodes:
       | File | Change |
       |------|--------|
       | `{file}` | {description} |
+
+      ### Quality Gates
+      **Gates run**: {QUALITY_GATES}
+      {Pass/fail status for each gate that was run}
 
       ### Validation
       {Type check, lint, and test results}
