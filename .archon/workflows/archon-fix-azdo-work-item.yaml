@@ -1,0 +1,441 @@
+name: archon-fix-azdo-work-item
+description: |
+  Use when: User wants to FIX, RESOLVE, or IMPLEMENT a solution for an Azure DevOps work item.
+  Triggers: "fix this work item", "implement work item 123", "resolve this bug", "fix item",
+            "fix work item #123", "resolve AB#123".
+  NOT for: Comprehensive multi-agent reviews, questions about items, CI failures, PR reviews.
+
+  Mirrors archon-fix-github-issue but uses Azure DevOps CLI (az) instead of gh:
+  1. Fetches the work item (az boards work-item show)
+  2. Classifies type (bug/feature/enhancement/etc)
+  3. Researches context (web + codebase)
+  4. Routes to investigate (bugs) or plan (features)
+  5. Implements the fix/feature with validation
+  6. Creates a draft PR (az repos pr create --draft)
+  7. Runs smart review (code review + conditional agents)
+  8. Aggressively self-fixes all findings
+  9. Simplifies changed code
+  10. Posts completion report as discussion comment on the work item
+
+provider: claude
+model: sonnet
+
+nodes:
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 1: FETCH & CLASSIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: extract-item-number
+    prompt: |
+      Find the Azure DevOps work item number for this request.
+
+      Request: $ARGUMENTS
+
+      Rules:
+      - If the message contains an explicit item number (e.g., "#709", "AB#709", "work item 709", "item 709", "709"), extract that number.
+      - If the message is ambiguous (e.g., "fix the login timeout bug"), search with WIQL:
+        ```bash
+        az boards query --wiql "SELECT [System.Id],[System.Title] FROM workitems \
+          WHERE [System.TeamProject] = @project \
+          AND [System.State] <> 'Closed' \
+          AND [System.Title] CONTAINS '<search-term>' \
+          ORDER BY [System.ChangedDate] DESC"
+        ```
+        Pick the best match and extract its Id field.
+
+      CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation.
+      Example correct output: 709
+
+  - id: fetch-item
+    bash: |
+      ITEM_NUM=$(echo "$extract-item-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      if [ -z "$ITEM_NUM" ]; then
+        echo "Failed to extract work item number from: $extract-item-number.output" >&2
+        exit 1
+      fi
+      echo "$ITEM_NUM" > "$ARTIFACTS_DIR/.work-item-id"
+      az boards work-item show --id "$ITEM_NUM" --expand all
+    depends_on: [extract-item-number]
+
+  - id: classify
+    prompt: |
+      You are an issue classifier. Analyze the Azure DevOps work item below and determine its type.
+
+      ## Work Item Content
+
+      $fetch-item.output
+
+      Note: AzDO work items store data under `fields`:
+      - `fields['System.WorkItemType']` — Bug, User Story, Task, Feature, Epic
+      - `fields['System.Title']` — title
+      - `fields['System.Description']` — description (HTML, ignore tags)
+      - `fields['System.State']` — Active, Resolved, Closed, etc.
+
+      ## Classification Rules
+
+      | Type | Indicators |
+      |------|------------|
+      | bug | WorkItemType=Bug OR "broken", "error", "crash", "doesn't work", stack traces, regression |
+      | feature | WorkItemType=Feature/Epic OR "add", "new", "support", net-new capability |
+      | enhancement | WorkItemType=User Story OR "improve", "better", "extend", incremental improvement |
+      | refactor | "clean up", "simplify", "reorganize", "restructure" |
+      | chore | WorkItemType=Task OR "update deps", "upgrade", "maintenance", "CI/CD" |
+      | documentation | "docs", "readme", "clarify", "examples" |
+
+      Provide reasoning for your classification.
+    depends_on: [fetch-item]
+    model: haiku
+    allowed_tools: []
+    output_format:
+      type: object
+      properties:
+        issue_type:
+          type: string
+          enum: ["bug", "feature", "enhancement", "refactor", "chore", "documentation"]
+        title:
+          type: string
+        reasoning:
+          type: string
+      required: [issue_type, title, reasoning]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 2: RESEARCH
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: web-research
+    command: archon-web-research
+    depends_on: [classify]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: investigate
+    command: archon-investigate-issue
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type == 'bug'"
+    context: fresh
+
+  - id: plan
+    command: archon-create-plan
+    depends_on: [classify, web-research]
+    when: "$classify.output.issue_type != 'bug'"
+    context: fresh
+
+  # Bridge: ensure investigation.md exists for the implement step
+  - id: bridge-artifacts
+    bash: |
+      if [ -f "$ARTIFACTS_DIR/plan.md" ] && [ ! -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        cp "$ARTIFACTS_DIR/plan.md" "$ARTIFACTS_DIR/investigation.md"
+        echo "Bridged plan.md to investigation.md for implement step"
+      elif [ -f "$ARTIFACTS_DIR/investigation.md" ]; then
+        echo "investigation.md exists from investigate step"
+      else
+        echo "WARNING: No investigation.md or plan.md found — implement may fail"
+      fi
+    depends_on: [investigate, plan]
+    trigger_rule: one_success
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 4: IMPLEMENT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: implement
+    command: archon-fix-issue
+    depends_on: [bridge-artifacts]
+    context: fresh
+    model: opus[1m]
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 5: VALIDATE
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: validate
+    command: archon-validate
+    depends_on: [implement]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 6: CREATE DRAFT PR
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: create-pr
+    prompt: |
+      Create a draft pull request using the Azure DevOps CLI.
+
+      ## Context
+
+      - **Work Item**: $ARGUMENTS
+      - **Classification**: $classify.output
+      - **Item title**: $classify.output.title
+
+      ## Instructions
+
+      1. Check git status. If uncommitted changes exist, stage and commit ONLY source files that are
+         part of the fix. Use `git add <path1> <path2> ...` — never `git add -A` or `git add .`.
+         Never commit artifacts (anything under `$ARTIFACTS_DIR`, `pr-body.md`, `*.scratch.md`).
+         Verify with `git status --porcelain` before committing.
+
+      2. Push the branch:
+         ```bash
+         git push -u origin HEAD
+         ```
+
+      3. Read implementation artifacts for context:
+         ```bash
+         cat "$ARTIFACTS_DIR/investigation.md" 2>/dev/null
+         cat "$ARTIFACTS_DIR/plan.md" 2>/dev/null
+         cat "$ARTIFACTS_DIR/implementation.md" 2>/dev/null
+         cat "$ARTIFACTS_DIR/validation.md" 2>/dev/null
+         ITEM_ID=$(cat "$ARTIFACTS_DIR/.work-item-id" 2>/dev/null)
+         ```
+
+      4. Check if a PR already exists for this branch:
+         ```bash
+         CURRENT_BRANCH=$(git branch --show-current)
+         az repos pr list --source-branch "$CURRENT_BRANCH" --status active --output json
+         ```
+         If one exists, capture its `pullRequestId` and skip to step 7.
+
+      5. Look for a PR description template at `.azuredevops/pull_request_template.md`,
+         `pull_request_template.md`, or `.github/PULL_REQUEST_TEMPLATE.md`. Read whichever exists.
+
+      6. Create the draft PR:
+         ```bash
+         az repos pr create \
+           --draft true \
+           --target-branch $BASE_BRANCH \
+           --title "<concise imperative title under 70 chars>" \
+           --description "<full PR body>" \
+           --work-items "$ITEM_ID"
+         ```
+         - If the description is long, write it to `$ARTIFACTS_DIR/pr-body.md` first, then use
+           `--description "$(cat $ARTIFACTS_DIR/pr-body.md)"`.
+         - Body must include: summary, changes, validation evidence, and `Related: AB#<item-id>`.
+         - Fill in every section of the template if one was found.
+
+      7. Capture PR identifiers:
+         ```bash
+         CURRENT_BRANCH=$(git branch --show-current)
+         PR_JSON=$(az repos pr list --source-branch "$CURRENT_BRANCH" --status active --output json)
+         PR_ID=$(echo "$PR_JSON" | jq -r '.[0].pullRequestId')
+         PR_URL=$(echo "$PR_JSON" | jq -r '.[0].url')
+         echo "$PR_ID" > "$ARTIFACTS_DIR/.pr-id"
+         echo "$PR_ID" > "$ARTIFACTS_DIR/.pr-number"
+         echo "$PR_URL" > "$ARTIFACTS_DIR/.pr-url"
+         ```
+    depends_on: [validate]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 7: REVIEW
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: verify-pr-base
+    bash: |
+      set -euo pipefail
+      EXPECTED="$BASE_BRANCH"
+      PR_ID=$(cat "$ARTIFACTS_DIR/.pr-id" 2>/dev/null || echo "")
+      if [ -z "$PR_ID" ]; then
+        echo "PR ID not found in artifacts — skipping base verification"
+        exit 0
+      fi
+      # AzDO returns refs/heads/main — strip prefix for comparison
+      ACTUAL_REF=$(az repos pr show --id "$PR_ID" --query "targetRefName" -o tsv)
+      ACTUAL="${ACTUAL_REF#refs/heads/}"
+      if [ "$ACTUAL" != "$EXPECTED" ]; then
+        echo "Base mismatch on PR #$PR_ID: expected=$EXPECTED actual=$ACTUAL — re-targeting" >&2
+        REPO_ID=$(az repos pr show --id "$PR_ID" --query "repository.id" -o tsv)
+        PATCH_FILE=$(mktemp /tmp/pr-base-patch.XXXXXX.json)
+        echo "{\"targetRefName\": \"refs/heads/$EXPECTED\"}" > "$PATCH_FILE"
+        az devops invoke \
+          --area git \
+          --resource pullRequests \
+          --route-parameters repositoryId="$REPO_ID" pullRequestId="$PR_ID" \
+          --http-method PATCH \
+          --in-file "$PATCH_FILE" \
+          --api-version 7.1 \
+          > /dev/null
+        rm -f "$PATCH_FILE"
+        echo "PR base updated to $EXPECTED"
+      else
+        echo "PR base verified: $EXPECTED"
+      fi
+    depends_on: [create-pr]
+
+  - id: review-scope
+    command: archon-azdo-pr-review-scope
+    depends_on: [verify-pr-base]
+    context: fresh
+
+  - id: review-classify
+    prompt: |
+      You are a PR review classifier. Analyze the PR scope and determine which review agents should run.
+
+      ## PR Scope
+
+      $review-scope.output
+
+      ## Rules
+
+      - **Code review**: ALWAYS run. Mandatory for every PR. Also checks CLAUDE.md rules.
+      - **Error handling**: Run if the diff touches try/catch, error handling, async/await, or new failure paths.
+      - **Test coverage**: Run if the diff touches source code (not just tests, docs, or config).
+      - **Comment quality**: Run if the diff adds or modifies comments, docstrings, or JSDoc.
+      - **Docs impact**: Run if the diff adds/removes public APIs, CLI flags, env vars, or user-facing features.
+
+      Provide your reasoning for each decision.
+    depends_on: [review-scope]
+    model: haiku
+    allowed_tools: []
+    context: fresh
+    output_format:
+      type: object
+      properties:
+        run_code_review:
+          type: string
+          enum: ["true", "false"]
+        run_error_handling:
+          type: string
+          enum: ["true", "false"]
+        run_test_coverage:
+          type: string
+          enum: ["true", "false"]
+        run_comment_quality:
+          type: string
+          enum: ["true", "false"]
+        run_docs_impact:
+          type: string
+          enum: ["true", "false"]
+        reasoning:
+          type: string
+      required:
+        - run_code_review
+        - run_error_handling
+        - run_test_coverage
+        - run_comment_quality
+        - run_docs_impact
+        - reasoning
+
+  - id: code-review
+    command: archon-code-review-agent
+    depends_on: [review-classify]
+    context: fresh
+
+  - id: error-handling
+    command: archon-error-handling-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_error_handling == 'true'"
+    context: fresh
+
+  - id: test-coverage
+    command: archon-test-coverage-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_test_coverage == 'true'"
+    context: fresh
+
+  - id: comment-quality
+    command: archon-comment-quality-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_comment_quality == 'true'"
+    context: fresh
+
+  - id: docs-impact
+    command: archon-docs-impact-agent
+    depends_on: [review-classify]
+    when: "$review-classify.output.run_docs_impact == 'true'"
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 8: SYNTHESIZE + SELF-FIX
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: synthesize
+    command: archon-synthesize-review
+    depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
+    trigger_rule: one_success
+    context: fresh
+
+  - id: self-fix
+    command: archon-self-fix-all
+    depends_on: [synthesize]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 9: SIMPLIFY
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: simplify
+    command: archon-simplify-changes
+    depends_on: [self-fix]
+    context: fresh
+
+  # ═══════════════════════════════════════════════════════════════
+  # PHASE 10: REPORT
+  # ═══════════════════════════════════════════════════════════════
+
+  - id: report
+    prompt: |
+      Post a completion report to the Azure DevOps work item as a discussion comment.
+
+      ## Phase 1: Load Artifacts
+
+      ```bash
+      ITEM_ID=$(cat "$ARTIFACTS_DIR/.work-item-id" 2>/dev/null || echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+      PR_ID=$(cat "$ARTIFACTS_DIR/.pr-id" 2>/dev/null || echo "unknown")
+      PR_URL=$(cat "$ARTIFACTS_DIR/.pr-url" 2>/dev/null || echo "unknown")
+      cat "$ARTIFACTS_DIR/investigation.md" 2>/dev/null
+      cat "$ARTIFACTS_DIR/plan.md" 2>/dev/null
+      cat "$ARTIFACTS_DIR/implementation.md" 2>/dev/null
+      cat "$ARTIFACTS_DIR/validation.md" 2>/dev/null
+      cat "$ARTIFACTS_DIR/review/consolidated-review.md" 2>/dev/null
+      cat "$ARTIFACTS_DIR/review/fix-report.md" 2>/dev/null
+      git log --oneline -5
+      ```
+
+      ## Phase 2: Post Work Item Comment
+
+      Compose a comment body and post it:
+
+      ```bash
+      az boards work-item update --id "$ITEM_ID" --discussion "<comment-body>"
+      ```
+
+      Comment format:
+      ```
+      ## Resolution Report
+
+      **PR**: !$PR_ID ($PR_URL)
+      **Status**: Complete
+
+      ### Summary
+      {2-4 sentences summarising what was done}
+
+      ### Changes Made
+      | File | Change |
+      |------|--------|
+      | `{file}` | {description} |
+
+      ### Validation
+      {Type check, lint, and test results}
+
+      ### Review & Self-Fix
+      - {n} review findings addressed
+      - {n} tests added
+      - {n} unaddressed items (with reasons if any)
+
+      ### Suggested Follow-up Work Items
+      {List items or "None."}
+
+      ---
+      Resolved by Archon workflow $WORKFLOW_ID
+      ```
+
+      ## Phase 3: Final Output
+
+      Print: work item ID, PR ID, PR URL, and brief summary of what was done.
+
+      Write the comment body to `$ARTIFACTS_DIR/completion-report.md` as well.
+    depends_on: [simplify]
+    context: fresh
