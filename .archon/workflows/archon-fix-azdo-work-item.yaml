@@ -55,11 +55,24 @@ nodes:
 
   - id: fetch-item
     bash: |
-      ITEM_NUM=$(echo "$extract-item-number.output" | tr -d "'\"\`\n " | grep -oE '[0-9]+' | head -1)
+      # Try ARGUMENTS first — most reliable when user passes an explicit number
+      ITEM_NUM=$(echo "$ARGUMENTS" | grep -oE '[0-9]+' | head -1)
+
+      # Fall back to AI-resolved output from extract-item-number
       if [ -z "$ITEM_NUM" ]; then
-        echo "Failed to extract work item number from: $extract-item-number.output" >&2
+        ITEM_NUM=$(echo "$extract-item-number.output" | tr -d "'\"\`\n\r ," | grep -oE '[0-9]+' | head -1)
+      fi
+
+      # Strip any remaining non-digit characters (defensive)
+      ITEM_NUM=$(printf '%s' "$ITEM_NUM" | tr -cd '0-9')
+
+      if [ -z "$ITEM_NUM" ]; then
+        echo "ERROR: could not extract a work item number." >&2
+        echo "  ARGUMENTS: $ARGUMENTS" >&2
+        echo "  extract-item-number output: $extract-item-number.output" >&2
         exit 1
       fi
+
       echo "$ITEM_NUM" > "$ARTIFACTS_DIR/.work-item-id"
       az boards work-item show --id "$ITEM_NUM" --expand all
     depends_on: [extract-item-number]
