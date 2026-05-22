@@ -241,8 +241,6 @@ nodes:
       Print: `CRG context: [N] nodes found, scope: [scope]`
     depends_on: [classify]
     context: fresh
-    provider: pi
-    model: kimi-coding/kimi-for-coding
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
