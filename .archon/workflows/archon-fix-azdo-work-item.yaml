@@ -723,8 +723,6 @@ nodes:
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
     context: fresh
-    provider: pi
-    model: kimi-k2.6
     output_format:
       type: object
       properties:
