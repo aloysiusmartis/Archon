@@ -157,13 +157,74 @@ nodes:
       required: [complexity, reason, quality_gates, ac_count]
 
   # ═══════════════════════════════════════════════════════════════
-  # PHASE 2: RESEARCH
+  # PHASE 2: CODEBASE CONTEXT (code-review-graph first, grep fallback)
+  # This is a LOCAL codebase connected to Azure DevOps — no web search needed.
   # ═══════════════════════════════════════════════════════════════
 
-  - id: web-research
-    command: archon-web-research
+  - id: crg-context
+    prompt: |
+      Gather codebase context for this Azure DevOps work item.
+      This is a LOCAL codebase — no web search needed.
+      Use code-review-graph MCP tools FIRST; grep/Read only as fallback.
+
+      ## Work Item
+      $fetch-item.output
+
+      ## Classification
+      $classify.output
+
+      ---
+
+      ## Step 1: Graph-first investigation
+
+      Use code-review-graph MCP tools BEFORE any Grep or Read calls:
+
+      1. `semantic_search_nodes` — find symbols and files mentioned in the work item title/description
+      2. `get_architecture_overview` — understand module and layer structure
+      3. `get_impact_radius` on the most likely change target — blast radius
+      4. `query_graph` with `callers_of` and `tests_for` — find callers and existing tests
+      5. `get_review_context` — get relevant code snippets for the found nodes
+
+      If code-review-graph is unavailable or returns no results, fall back to:
+      ```bash
+      git log --oneline -10
+      # then targeted grep and selective file reads
+      ```
+
+      ## Step 2: Determine change scope
+
+      Classify as one of:
+      - `single-file` — one CSS/config/text change, no logic changes
+      - `component` — one or two UI components, no new services
+      - `multi-file` — multiple logical layers affected
+      - `service-level` — new endpoints, schema changes, or cross-service impact
+
+      ## Step 3: Write artifact
+      Write `$ARTIFACTS_DIR/web-research.md`:
+
+      ```markdown
+      # Codebase Context — [work item title]
+
+      ## Relevant Components
+      [files and functions from CRG — include file:line references]
+
+      ## Impact Radius
+      [callers, dependents, related test files]
+
+      ## Change Scope
+      [single-file | component | multi-file | service-level] — [one-sentence reasoning]
+
+      ## Existing Test Coverage
+      [test files that cover the affected code]
+
+      ## Key Pointers
+      [root cause hints, git blame leads, anything that speeds up investigation/implement]
+      ```
+
+      Print: `CRG context: [N] nodes found, scope: [scope]`
     depends_on: [classify]
     context: fresh
+    model: sonnet
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
@@ -171,13 +232,13 @@ nodes:
 
   - id: investigate
     command: archon-investigate-issue
-    depends_on: [classify, web-research, complexity-gate]
+    depends_on: [classify, crg-context, complexity-gate]
     when: "$classify.output.issue_type == 'bug'"
     context: fresh
 
   - id: plan
     command: archon-create-plan
-    depends_on: [classify, web-research, complexity-gate]
+    depends_on: [classify, crg-context, complexity-gate]
     when: "$classify.output.issue_type != 'bug'"
     context: fresh
 
@@ -643,10 +704,25 @@ nodes:
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
     context: fresh
+    output_format:
+      type: object
+      properties:
+        has_blocking_findings:
+          type: boolean
+          description: "true if there are CRITICAL or HIGH severity findings requiring fixes before merge"
+        verdict:
+          type: string
+          enum: ["APPROVE", "REQUEST_CHANGES"]
+        critical_count:
+          type: integer
+        high_count:
+          type: integer
+      required: [has_blocking_findings, verdict, critical_count, high_count]
 
   - id: self-fix
     command: archon-self-fix-all
     depends_on: [synthesize]
+    when: "$synthesize.output.has_blocking_findings == 'true'"
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════
@@ -655,7 +731,8 @@ nodes:
 
   - id: simplify
     command: archon-simplify-changes
-    depends_on: [self-fix]
+    depends_on: [self-fix, synthesize]
+    trigger_rule: one_success
     context: fresh
 
   # ═══════════════════════════════════════════════════════════════
