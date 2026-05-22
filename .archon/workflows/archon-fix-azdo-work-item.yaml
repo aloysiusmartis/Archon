@@ -50,6 +50,8 @@ nodes:
 
       CRITICAL: Your final output must be ONLY the bare number with no quotes, no markdown, no explanation.
       Example correct output: 709
+    model: haiku
+    context: fresh
 
   - id: fetch-item
     bash: |
@@ -91,6 +93,7 @@ nodes:
     depends_on: [fetch-item]
     model: haiku
     allowed_tools: []
+    context: fresh
     output_format:
       type: object
       properties:
@@ -140,6 +143,7 @@ nodes:
     depends_on: [fetch-item, classify]
     model: haiku
     allowed_tools: []
+    context: fresh
     output_format:
       type: object
       properties:
@@ -224,7 +228,8 @@ nodes:
       Print: `CRG context: [N] nodes found, scope: [scope]`
     depends_on: [classify]
     context: fresh
-    model: sonnet
+    provider: pi
+    model: kimi-for-coding
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 3: INVESTIGATE (bugs) / PLAN (features)
@@ -427,6 +432,8 @@ nodes:
     depends_on: [eng-review]
     when: "$complexity-gate.output.complexity == 'complex'"
     context: fresh
+    provider: pi
+    model: kimi-k2.6
 
   - id: simple-path-bridge
     bash: |
@@ -484,6 +491,7 @@ nodes:
     depends_on: [enrich-ado, simple-path-bridge]
     trigger_rule: one_success
     model: haiku
+    context: fresh
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 4: IMPLEMENT
@@ -493,7 +501,8 @@ nodes:
     command: archon-fix-issue
     depends_on: [quality-gate-config]
     context: fresh
-    model: opus[1m]
+    provider: pi
+    model: kimi-for-coding
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 5: VALIDATE
@@ -575,6 +584,7 @@ nodes:
          ```
     depends_on: [validate]
     context: fresh
+    model: haiku
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 7: REVIEW
@@ -676,24 +686,32 @@ nodes:
     depends_on: [review-classify]
     when: "$review-classify.output.run_error_handling == 'true'"
     context: fresh
+    provider: pi
+    model: kimi-for-coding
 
   - id: test-coverage
     command: archon-test-coverage-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_test_coverage == 'true'"
     context: fresh
+    provider: pi
+    model: kimi-for-coding
 
   - id: comment-quality
     command: archon-comment-quality-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_comment_quality == 'true'"
     context: fresh
+    provider: pi
+    model: kimi-for-coding
 
   - id: docs-impact
     command: archon-docs-impact-agent
     depends_on: [review-classify]
     when: "$review-classify.output.run_docs_impact == 'true'"
     context: fresh
+    provider: pi
+    model: kimi-for-coding
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 8: SYNTHESIZE + SELF-FIX
@@ -704,6 +722,8 @@ nodes:
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
     context: fresh
+    provider: pi
+    model: kimi-for-coding
     output_format:
       type: object
       properties:
@@ -724,6 +744,8 @@ nodes:
     depends_on: [synthesize]
     when: "$synthesize.output.has_blocking_findings == 'true'"
     context: fresh
+    provider: pi
+    model: kimi-for-coding
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 9: SIMPLIFY
@@ -734,6 +756,8 @@ nodes:
     depends_on: [self-fix, synthesize]
     trigger_rule: one_success
     context: fresh
+    provider: pi
+    model: kimi-for-coding
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 10: REPORT
@@ -809,3 +833,5 @@ nodes:
       Write the comment body to `$ARTIFACTS_DIR/completion-report.md` as well.
     depends_on: [simplify]
     context: fresh
+    provider: pi
+    model: kimi-for-coding
