@@ -584,7 +584,6 @@ nodes:
          ```
     depends_on: [validate]
     context: fresh
-    model: haiku
 
   # ═══════════════════════════════════════════════════════════════
   # PHASE 7: REVIEW
@@ -722,8 +721,6 @@ nodes:
     depends_on: [code-review, error-handling, test-coverage, comment-quality, docs-impact]
     trigger_rule: one_success
     context: fresh
-    provider: pi
-    model: kimi-for-coding
     output_format:
       type: object
       properties:
